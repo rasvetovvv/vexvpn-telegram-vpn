@@ -70,6 +70,7 @@ async def init_db() -> None:
         await _ensure_column(conn, "subscriptions", "security_last_alert_at", "security_last_alert_at TIMESTAMP WITH TIME ZONE")
         await _ensure_column(conn, "subscriptions", "reset_count", "reset_count INTEGER DEFAULT 0")
         await _ensure_column(conn, "subscriptions", "last_reset_at", "last_reset_at TIMESTAMP WITH TIME ZONE")
+        await _ensure_unique_index(conn, "subscriptions", "uq_subscriptions_marzban_username", "marzban_username")
         await _ensure_column(conn, "payments", "promo_code", "promo_code VARCHAR(32)")
         await _ensure_column(conn, "payments", "status", "status VARCHAR(16) DEFAULT 'success'")
         await _ensure_column(conn, "payments", "error_message", "error_message TEXT")

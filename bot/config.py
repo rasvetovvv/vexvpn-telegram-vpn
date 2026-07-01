@@ -155,6 +155,7 @@ class Settings(BaseSettings):
 
     # БД
     database_url: str = "postgresql+asyncpg://vpnbot:vpnbot@db:5432/vpnbot"
+    redis_url: str = ""  # shared rate-limit storage; empty = in-memory fallback for single-process dev
 
     # Marzban
     marzban_base_url: str = "https://vpn.example.com"
@@ -162,6 +163,11 @@ class Settings(BaseSettings):
     marzban_password: str = "admin"
     marzban_proxies: str = "vless"  # "vless,vmess,trojan"
     marzban_flow: str = ""
+    marzban_tls_ca_file: str = ""  # optional CA bundle/path for private/self-signed Marzban TLS
+
+    # Web/Mini App security
+    trusted_proxy_ips: str = ""  # comma-separated IPs/CIDRs allowed to supply X-Forwarded-For/X-Real-IP
+    telegram_init_data_max_age_seconds: int = 21600  # 6h replay window; auth_date is mandatory
 
     # Прочее
     support_username: str = "support"

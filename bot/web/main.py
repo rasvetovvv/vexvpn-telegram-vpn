@@ -4,6 +4,8 @@ import asyncio
 import base64
 import hashlib
 import html
+import ipaddress
+import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import parse_qsl, quote, urlencode, urlparse, urlunparse
@@ -45,6 +47,7 @@ from bot.db.repo import (
     set_active_promo,
     set_daily_free_claim_status,
     set_ticket_status,
+    should_send_alert,
     update_payment_status,
 )
 from bot.services import gamification as gami
@@ -62,15 +65,21 @@ BASE_DIR = Path(__file__).resolve().parents[2]
 STATIC_DIR = BASE_DIR / "miniapp" / "static"
 
 app = FastAPI(title="VexVPN Mini App", version="1.0.0")
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 app.include_router(admin_router)
 
 PROMO_RATE = RateLimit(limit=5, window_seconds=60)
 INVOICE_RATE = RateLimit(limit=8, window_seconds=60)
 CHECK_VPN_RATE = RateLimit(limit=6, window_seconds=60)
+PUBLIC_SUB_RATE = RateLimit(limit=30, window_seconds=60)  # /sub and /happ hit Marzban; protect upstream panel
+PUBLIC_QR_RATE = RateLimit(limit=60, window_seconds=60)  # QR render is CPU-bound and unauthenticated
 GAMI_RATE = RateLimit(limit=12, window_seconds=60)
 DEVICE_RESET_RATE = RateLimit(limit=3, window_seconds=300)
 SUPPORT_RATE = RateLimit(limit=10, window_seconds=60)
+ABUSE_BLOCK_SPIKE_THRESHOLD = 3
+ABUSE_BLOCK_SPIKE_WINDOW_SECONDS = 10 * 60
 
 _bot_username_cache: str | None = None
 
@@ -96,18 +105,36 @@ async def _resolve_bot_username() -> str:
     return settings.bot_username
 
 
+def _effective_port(parsed) -> int | None:
+    """Return explicit or scheme-default port; None for unsupported schemes."""
+    if parsed.port:
+        return parsed.port
+    if parsed.scheme == "https":
+        return 443
+    if parsed.scheme == "http":
+        return 80
+    return None
+
+
 def _is_own_subscription_url(url: str) -> bool:
-    """Разрешить check-vpn только для URL подписки нашего Marzban."""
+    """Allow check-vpn only for the exact configured Marzban origin.
+
+    The origin check is intentionally strict: scheme + hostname + effective port
+    must match settings.marzban_base_url. This prevents a URL on the same host
+    but a different port/service from passing SSRF validation.
+    """
     try:
         parsed = urlparse(url)
         allowed = urlparse(settings.marzban_base_url)
     except Exception:
         return False
-    if parsed.scheme != "https":
+    if parsed.scheme != "https" or allowed.scheme != "https":
         return False
     if not parsed.hostname or not allowed.hostname:
         return False
-    return parsed.hostname.lower() == allowed.hostname.lower()
+    if parsed.hostname.lower() != allowed.hostname.lower():
+        return False
+    return _effective_port(parsed) == _effective_port(allowed)
 
 
 DAILY_FREE_PLAN = Plan("daily_free", "Ежедневный бесплатный VPN", 1, 0, 100, 1, "каждый день", visible=False)
@@ -124,10 +151,79 @@ def _hash_value(value: str | None) -> str | None:
     return hashlib.sha256(f"{settings.bot_token}:{value}".encode()).hexdigest()
 
 
+def _trusted_proxy_networks() -> tuple[ipaddress._BaseNetwork, ...]:
+    """Configured reverse proxies allowed to supply client IP headers.
+
+    X-Forwarded-For/X-Real-IP are user-controlled unless the direct peer is a
+    trusted reverse proxy. Keep this list narrow: exact proxy IPs or Docker/LAN
+    CIDRs that are not reachable by arbitrary internet clients.
+    """
+    networks: list[ipaddress._BaseNetwork] = []
+    for item in (settings.trusted_proxy_ips or "").replace(";", ",").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            networks.append(ipaddress.ip_network(item, strict=False))
+        except ValueError:
+            # Invalid config should fail closed: ignore bad entries and fall back
+            # to the direct peer address instead of trusting spoofable headers.
+            continue
+    return tuple(networks)
+
+
+def _is_trusted_proxy(peer_ip: str | None) -> bool:
+    if not peer_ip:
+        return False
+    try:
+        ip = ipaddress.ip_address(peer_ip)
+    except ValueError:
+        return False
+    return any(ip in network for network in _trusted_proxy_networks())
+
+
+def _first_valid_forwarded_ip(header_value: str) -> str | None:
+    for part in (header_value or "").split(","):
+        candidate = part.strip()
+        if not candidate:
+            continue
+        try:
+            ipaddress.ip_address(candidate)
+        except ValueError:
+            continue
+        return candidate
+    return None
+
+
 def _client_ip(request: Request) -> str:
-    forwarded = request.headers.get("x-forwarded-for", "").split(",")[0].strip()
-    real_ip = request.headers.get("x-real-ip", "").strip()
-    return forwarded or real_ip or (request.client.host if request.client else "")
+    peer_ip = request.client.host if request.client else ""
+    if _is_trusted_proxy(peer_ip):
+        forwarded = _first_valid_forwarded_ip(request.headers.get("x-forwarded-for", ""))
+        real_ip = _first_valid_forwarded_ip(request.headers.get("x-real-ip", ""))
+        return forwarded or real_ip or peer_ip
+    return peer_ip
+
+
+def _require_public_ip_rate_limit(request: Request, namespace: str, rule: RateLimit) -> None:
+    """Rate-limit public unauthenticated endpoints by hashed client IP.
+
+    Raw client IP is not stored in the in-memory rate-limit key; the hash uses
+    the bot token as salt via _hash_value(). XFF is only considered when the
+    direct peer is a trusted proxy, because _client_ip() enforces that.
+    """
+    ip_hash = _hash_value(_client_ip(request)) or "unknown"
+    require_rate_limit(f"public:{namespace}:ip:{ip_hash}", rule)
+
+
+def _marzban_tls_verify() -> bool | str:
+    """TLS verification setting for Marzban subscription fetches.
+
+    Default is strict certificate verification (True). If Marzban uses a private
+    CA/self-signed certificate, set MARZBAN_TLS_CA_FILE to a mounted CA bundle.
+    We intentionally do not support a "disable verification" switch here.
+    """
+    ca_file = (settings.marzban_tls_ca_file or "").strip()
+    return ca_file or True
 
 
 def _seconds_until_next_utc_day(now: datetime | None = None) -> int:
@@ -153,10 +249,56 @@ async def _record_open_from_request(session, telegram_id: int, tg_user: dict, re
     return fp_hash, ip_hash
 
 
+async def _log_abuse_flag_and_alert(
+    session,
+    *,
+    telegram_id: int | None,
+    kind: str,
+    severity: str,
+    fingerprint_hash: str | None = None,
+    ip_hash: str | None = None,
+    details: str | None = None,
+) -> None:
+    """Log abuse flag and alert admins when block events spike.
+
+    The alert intentionally does not include raw IP, fingerprint, subscription
+    token or other sensitive identifiers. Hash prefixes are enough for operators
+    to correlate repeated abuse without storing/displaying raw values.
+    """
+    await log_abuse_flag(
+        session,
+        telegram_id=telegram_id,
+        kind=kind,
+        severity=severity,
+        fingerprint_hash=fingerprint_hash,
+        ip_hash=ip_hash,
+        details=details,
+    )
+    if severity != "block":
+        return
+    since = datetime.now(timezone.utc) - timedelta(seconds=ABUSE_BLOCK_SPIKE_WINDOW_SECONDS)
+    blocks = await session.scalar(select(func.count(AbuseFlag.id)).where(AbuseFlag.severity == "block", AbuseFlag.created_at >= since)) or 0
+    if blocks < ABUSE_BLOCK_SPIKE_THRESHOLD:
+        return
+    key = f"abuse-block-spike:{ABUSE_BLOCK_SPIKE_WINDOW_SECONDS}"
+    msg = (
+        "🚨 <b>VexVPN anti-fraud spike</b>\n"
+        f"Block-level abuse flags in last {ABUSE_BLOCK_SPIKE_WINDOW_SECONDS // 60} min: <b>{int(blocks)}</b>\n"
+        f"Latest kind: <code>{html.escape(kind[:32])}</code>\n"
+        f"Telegram ID: <code>{telegram_id or 'unknown'}</code>\n"
+        f"Fingerprint hash: <code>{(fingerprint_hash or '-')[:12]}</code>\n"
+        f"IP hash: <code>{(ip_hash or '-')[:12]}</code>\n"
+        "This may indicate farming against the free VPN flow. Check admin abuse flags and rate-limit dashboards."
+    )
+    if await should_send_alert(session, key, cooldown_minutes=15, message=msg):
+        await notify_admins(msg)
+
+
 @app.middleware("http")
 async def security_headers(request: Request, call_next):
     response = await call_next(request)
     response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
     response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
     response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
     response.headers.setdefault("Cross-Origin-Opener-Policy", "same-origin")
@@ -282,16 +424,18 @@ async def transparency_page() -> Response:
 
 
 @app.get("/api/qr.svg")
-async def qr_svg(data: str = Query(..., min_length=1, max_length=1200)) -> Response:
+async def qr_svg(request: Request, data: str = Query(..., min_length=1, max_length=1200)) -> Response:
     """SVG QR-код для ссылки подписки без внешних сервисов."""
+    _require_public_ip_rate_limit(request, "qr", PUBLIC_QR_RATE)
     factory = qrcode.image.svg.SvgPathImage
     img = qrcode.make(data, image_factory=factory, box_size=12, border=2)
     return Response(content=img.to_string(encoding="unicode"), media_type="image/svg+xml")
 
 
 @app.get("/api/qr.png")
-async def qr_png(data: str = Query(..., min_length=1, max_length=1200)) -> Response:
+async def qr_png(request: Request, data: str = Query(..., min_length=1, max_length=1200)) -> Response:
     """PNG QR-код подписки (для скачивания), без внешних сервисов (pypng)."""
+    _require_public_ip_rate_limit(request, "qr", PUBLIC_QR_RATE)
     import io
 
     from qrcode.image.pure import PyPNGImage
@@ -402,6 +546,7 @@ def _status_page_html(*, token: str, raw_url: str, public_url: str, subscription
 @app.get('/sub/{token}')
 async def subscription_gateway(token: str, request: Request, raw: int = Query(0), happ: int = Query(0)) -> Response:
     """Публичная ссылка подписки: браузеру красивая страница, VPN-клиенту raw Marzban config."""
+    _require_public_ip_rate_limit(request, "subscription", PUBLIC_SUB_RATE)
     token = token.strip().strip('/')[:512]
     raw_url = f"{settings.marzban_base_url.rstrip('/')}/sub/{token}"
     public_url = f"{settings.sub_public_base}/sub/{token}"
@@ -409,7 +554,7 @@ async def subscription_gateway(token: str, request: Request, raw: int = Query(0)
     raw_resp = None
     raw_ok = False
     try:
-        async with httpx.AsyncClient(timeout=8.0, verify=False) as client:
+        async with httpx.AsyncClient(timeout=8.0, verify=_marzban_tls_verify()) as client:
             raw_resp = await client.get(raw_url, headers={'user-agent': request.headers.get('user-agent', 'VexVPN-Gateway/1.0')})
         raw_ok = raw_resp.status_code == 200
     except Exception:
@@ -766,7 +911,7 @@ async def daily_free_claim(payload: FingerprintIn, request: Request, tg_user: di
         device_count = await session.scalar(select(func.count(MiniAppDevice.id)).where(MiniAppDevice.telegram_id == telegram_id)) or 0
         if device_count > MAX_FREE_DEVICES_PER_USER:
             reasons.append(f"у аккаунта устройств {device_count}/{MAX_FREE_DEVICES_PER_USER}")
-            await log_abuse_flag(session, telegram_id=telegram_id, kind="too_many_devices", severity="block", fingerprint_hash=fp_hash, ip_hash=ip_hash, details="; ".join(reasons))
+            await _log_abuse_flag_and_alert(session, telegram_id=telegram_id, kind="too_many_devices", severity="block", fingerprint_hash=fp_hash, ip_hash=ip_hash, details="; ".join(reasons))
             raise HTTPException(status_code=403, detail="Free VPN доступен максимум на 3 устройства. Напиши в поддержку, если это ошибка.")
 
         fp_accounts_today = 0
@@ -791,13 +936,13 @@ async def daily_free_claim(payload: FingerprintIn, request: Request, tg_user: di
             ) or 0
         if fp_accounts_today >= MAX_FREE_ACCOUNTS_PER_DEVICE_DAY:
             details = f"device accounts today={fp_accounts_today}; " + "; ".join(reasons)
-            await log_abuse_flag(session, telegram_id=telegram_id, kind="device_farm", severity="block", fingerprint_hash=fp_hash, ip_hash=ip_hash, details=details)
+            await _log_abuse_flag_and_alert(session, telegram_id=telegram_id, kind="device_farm", severity="block", fingerprint_hash=fp_hash, ip_hash=ip_hash, details=details)
             raise HTTPException(status_code=403, detail="С этого устройства уже получали бесплатный VPN на несколько аккаунтов. Доступ ограничен.")
         if ip_accounts_today >= MAX_FREE_ACCOUNTS_PER_IP_DAY:
             details = f"ip accounts today={ip_accounts_today}; " + "; ".join(reasons)
             await log_abuse_flag(session, telegram_id=telegram_id, kind="ip_farm", severity="warn", fingerprint_hash=fp_hash, ip_hash=ip_hash, details=details)
         if risk >= 70:
-            await log_abuse_flag(session, telegram_id=telegram_id, kind="high_risk_free", severity="block", fingerprint_hash=fp_hash, ip_hash=ip_hash, details="; ".join(reasons))
+            await _log_abuse_flag_and_alert(session, telegram_id=telegram_id, kind="high_risk_free", severity="block", fingerprint_hash=fp_hash, ip_hash=ip_hash, details="; ".join(reasons))
             raise HTTPException(status_code=403, detail="Не удалось проверить устройство для бесплатного VPN. Открой MiniApp из Telegram и попробуй ещё раз.")
         if risk >= 25 or fp_accounts_today or ip_accounts_today >= 2:
             await log_abuse_flag(session, telegram_id=telegram_id, kind="risky_free", severity="warn", fingerprint_hash=fp_hash, ip_hash=ip_hash, details=f"risk={risk}; device_today={fp_accounts_today}; ip_today={ip_accounts_today}; " + "; ".join(reasons))

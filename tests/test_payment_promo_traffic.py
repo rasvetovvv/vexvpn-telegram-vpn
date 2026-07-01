@@ -3,11 +3,15 @@ from __future__ import annotations
 import asyncio
 import unittest
 
-from bot.config import PROMOS, Plan, settings
+from bot.config import PROMOS, Plan
 from bot.services import payments
 from bot.services.marzban import MarzbanClient, MarzbanError
 from bot.services.promos import parse_promo_create_args
 from bot.utils import fmt_size
+
+
+async def _async_value(value):
+    return value
 
 
 class _FakeResponse:
@@ -106,7 +110,7 @@ class TrafficGrantTests(unittest.IsolatedAsyncioTestCase):
 
         client.get_user = fake_get_user  # type: ignore[method-assign]
         client._request = fake_request  # type: ignore[method-assign]
-        return await client.create_or_renew(12345, plan)
+        return await client.create_or_renew(12345, plan, username=username)
 
     async def _capture_payload(self, existing: dict | None, plan: Plan) -> dict:
         client = MarzbanClient()
@@ -128,13 +132,72 @@ class TrafficGrantTests(unittest.IsolatedAsyncioTestCase):
 
         client.get_user = fake_get_user  # type: ignore[method-assign]
         client._request = fake_request  # type: ignore[method-assign]
-        await client.create_or_renew(12345, plan)
+        await client.create_or_renew(12345, plan, username="tg_12345")
         return captured[0]
 
     async def test_create_sets_device_note(self) -> None:
         plan = Plan("family_30d", "Family", 30, 390, 0, 5, unlimited=True)
         payload = await self._capture_payload(None, plan)
         self.assertIn("devices:5", payload["note"])
+        self.assertNotIn("tg:", payload["note"])
+
+    async def test_new_accounts_use_random_marzban_username_when_no_mapping_exists(self) -> None:
+        client = MarzbanClient()
+        client.base_url = "https://vpn.example.com"
+        seen: list[str] = []
+
+        async def fake_stored(_telegram_id):
+            return None
+
+        async def fake_get_user(username, _http_client):
+            seen.append(username)
+            # legacy probe and random collision checks see no existing Marzban user
+            return None
+
+        async def fake_request(method, path, _http_client, **kwargs):
+            payload = kwargs["json"]
+            return _FakeResponse(201, {
+                "username": payload["username"],
+                "subscription_url": "/sub/random-token",
+                "expire": payload["expire"],
+                "data_limit": payload["data_limit"],
+            })
+
+        client._stored_username = fake_stored  # type: ignore[method-assign]
+        client.get_user = fake_get_user  # type: ignore[method-assign]
+        client._request = fake_request  # type: ignore[method-assign]
+        result = await client.create_or_renew(12345, Plan("lite", "Lite", 1, 1, 1, 1))
+        self.assertRegex(result["username"], r"^vxu_[0-9a-f]{24}$")
+        self.assertNotEqual(result["username"], "tg_12345")
+        self.assertIn("tg_12345", seen)  # legacy probe for backward compatibility
+
+    async def test_existing_mapping_is_preserved_for_renewal(self) -> None:
+        client = MarzbanClient()
+        client.base_url = "https://vpn.example.com"
+        mapped = "vxu_existingabcdef1234567890"
+
+        async def fake_stored(_telegram_id):
+            return mapped
+
+        async def fake_get_user(username, _http_client):
+            self.assertEqual(username, mapped)
+            return {"expire": 2_000_000_000, "data_limit": 10 * 1024**3, "note": "vexvpn | devices:2"}
+
+        async def fake_request(method, path, _http_client, **kwargs):
+            self.assertIn(mapped, path)
+            payload = kwargs["json"]
+            return _FakeResponse(200, {
+                "username": mapped,
+                "subscription_url": "/sub/existing-token",
+                "expire": payload["expire"],
+                "data_limit": payload["data_limit"],
+            })
+
+        client._stored_username = fake_stored  # type: ignore[method-assign]
+        client.get_user = fake_get_user  # type: ignore[method-assign]
+        client._request = fake_request  # type: ignore[method-assign]
+        result = await client.create_or_renew(12345, Plan("lite", "Lite", 1, 1, 1, 2))
+        self.assertEqual(result["username"], mapped)
 
     async def test_renew_does_not_downgrade_device_note(self) -> None:
         # Был family (5 устройств), пришёл реф-бонус (devices=1) → лимит в note не понижаем.
@@ -203,7 +266,7 @@ class TrafficGrantTests(unittest.IsolatedAsyncioTestCase):
         client.get_user = fake_get_user  # type: ignore[method-assign]
         plan = Plan("traffic_30gb", "Traffic 30GB", 0, 20, 30, 1, traffic_only=True)
         with self.assertRaises(MarzbanError):
-            await client.create_or_renew(12345, plan)
+            await client.create_or_renew(12345, plan, username="tg_12345")
 
     async def test_get_usage_parses_fields(self) -> None:
         client = MarzbanClient()
@@ -212,6 +275,7 @@ class TrafficGrantTests(unittest.IsolatedAsyncioTestCase):
             return {"used_traffic": 5 * 1024**3, "data_limit": 30 * 1024**3, "expire": 123, "status": "active"}
 
         client.get_user = fake_get_user  # type: ignore[method-assign]
+        client._stored_username = lambda _telegram_id: _async_value("tg_12345")  # type: ignore[method-assign]
         usage = await client.get_usage(12345)
         self.assertEqual(usage["used_traffic"], 5 * 1024**3)
         self.assertEqual(usage["data_limit"], 30 * 1024**3)
@@ -224,9 +288,10 @@ class TrafficGrantTests(unittest.IsolatedAsyncioTestCase):
             return None
 
         client.get_user = fake_get_user  # type: ignore[method-assign]
+        client._stored_username = lambda _telegram_id: _async_value("tg_12345")  # type: ignore[method-assign]
         self.assertIsNone(await client.get_usage(12345))
 
-    async def test_revoke_sub_returns_new_public_gateway_url(self) -> None:
+    async def test_revoke_sub_returns_new_full_url(self) -> None:
         client = MarzbanClient()
         client.base_url = "https://vpn.example.com"
 
@@ -236,8 +301,12 @@ class TrafficGrantTests(unittest.IsolatedAsyncioTestCase):
             return _FakeResponse(200, {"subscription_url": "/sub/new"})
 
         client._request = fake_request  # type: ignore[method-assign]
+        client._stored_username = lambda _telegram_id: _async_value("tg_12345")  # type: ignore[method-assign]
         url = await client.revoke_sub(12345)
-        self.assertEqual(url, f"{settings.sub_public_base}/sub/new")
+        # Public subscription URLs must point to the VexVPN gateway, not directly
+        # to Marzban, so browsers get the status/instructions page and clients
+        # still receive raw configs.
+        self.assertEqual(url, "https://proxy.vexory.xyz/sub/new")
 
     async def test_get_usage_is_cached_and_invalidated(self) -> None:
         # Баг 4: повторный показ кабинета не должен дёргать панель — отдаём из кэша.
@@ -249,6 +318,7 @@ class TrafficGrantTests(unittest.IsolatedAsyncioTestCase):
             return {"used_traffic": 1, "data_limit": 2, "expire": 3, "status": "active"}
 
         client.get_user = fake_get_user  # type: ignore[method-assign]
+        client._stored_username = lambda _telegram_id: _async_value("tg_777")  # type: ignore[method-assign]
         first = await client.get_usage(777)
         second = await client.get_usage(777)
         self.assertEqual(first, second)

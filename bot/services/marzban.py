@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import re
+import secrets
 import time
 from urllib.parse import urlparse
 
@@ -26,12 +27,21 @@ def _parse_note_devices(note: str | None) -> int:
 
 
 def _device_note(telegram_id: int, devices: int) -> str:
-    """Заметка для пользователя Marzban с лимитом устройств.
+    """Device-limit note for Marzban without exposing Telegram ID.
 
-    Marzban core не ограничивает устройства сам — этот note виден в панели и его
-    может читать внешний IP-лимитер. Реального enforcement без лимитера нет.
+    Older accounts may still have legacy notes like `tg:<id> | devices:N`.
+    New/updated accounts use only a coarse internal marker plus the device limit;
+    the Telegram↔Marzban mapping lives in the local subscriptions table.
     """
-    return f"tg:{telegram_id} | devices:{devices}"
+    return f"vexvpn | devices:{devices}"
+
+
+def _legacy_username(telegram_id: int) -> str:
+    return f"tg_{telegram_id}"
+
+
+def _random_username() -> str:
+    return f"vxu_{secrets.token_hex(12)}"
 
 
 class MarzbanClient:
@@ -109,10 +119,49 @@ class MarzbanClient:
         """Сбросить кэш потребления после изменения юзера (выдача/сброс/статус)."""
         self._usage_cache.pop(telegram_id, None)
 
+    async def _stored_username(self, telegram_id: int) -> str | None:
+        """Return local Telegram→Marzban mapping, if it exists.
+
+        Fail closed for privacy only when creating new accounts; for operational
+        actions on legacy accounts we fall back to tg_<id> so existing users are
+        not broken by the migration.
+        """
+        try:
+            from sqlalchemy import select
+            from bot.db.database import session_maker
+            from bot.db.models import Subscription
+
+            async with session_maker() as session:
+                return await session.scalar(select(Subscription.marzban_username).where(Subscription.telegram_id == telegram_id))
+        except Exception:
+            logger.warning("Could not resolve stored Marzban username for %s; using legacy fallback", telegram_id, exc_info=True)
+            return None
+
+    async def _username_for_existing(self, telegram_id: int) -> str:
+        return await self._stored_username(telegram_id) or _legacy_username(telegram_id)
+
+    async def _username_for_create_or_renew(self, telegram_id: int, client: httpx.AsyncClient, explicit_username: str | None = None) -> str:
+        if explicit_username:
+            return explicit_username
+        stored = await self._stored_username(telegram_id)
+        if stored:
+            return stored
+        legacy = _legacy_username(telegram_id)
+        try:
+            if await self.get_user(legacy, client):
+                return legacy
+        except Exception:
+            logger.warning("Could not probe legacy Marzban username for %s", telegram_id, exc_info=True)
+        for _ in range(8):
+            candidate = _random_username()
+            if not await self.get_user(candidate, client):
+                return candidate
+        raise MarzbanError("Не удалось сгенерировать уникальный Marzban username")
+
     async def reset_traffic(self, telegram_id: int) -> None:
         """Сбросить израсходованный трафик пользователя (used_traffic → 0)."""
-        username = f"tg_{telegram_id}"
         async with httpx.AsyncClient(timeout=15.0) as client:
+            username = await self._username_for_existing(telegram_id)
             resp = await self._request("POST", f"/api/user/{username}/reset", client)
         if resp.status_code not in (200, 204):
             raise MarzbanError(f"reset: {resp.status_code} {resp.text}")
@@ -122,8 +171,8 @@ class MarzbanClient:
         """Включить/выключить пользователя (status: active|disabled)."""
         if status not in ("active", "disabled"):
             raise MarzbanError(f"Недопустимый статус: {status}")
-        username = f"tg_{telegram_id}"
         async with httpx.AsyncClient(timeout=15.0) as client:
+            username = await self._username_for_existing(telegram_id)
             resp = await self._request("PUT", f"/api/user/{username}", client, json={"status": status})
         if resp.status_code != 200:
             raise MarzbanError(f"set_status: {resp.status_code} {resp.text}")
@@ -136,8 +185,8 @@ class MarzbanClient:
         перестают работать. Используется для self-service «сменить устройство».
         Возвращает новую полную ссылку подписки.
         """
-        username = f"tg_{telegram_id}"
         async with httpx.AsyncClient(timeout=15.0) as client:
+            username = await self._username_for_existing(telegram_id)
             resp = await self._request("POST", f"/api/user/{username}/revoke_sub", client)
         if resp.status_code != 200:
             raise MarzbanError(f"revoke_sub: {resp.status_code} {resp.text}")
@@ -146,8 +195,8 @@ class MarzbanClient:
 
     async def delete_user(self, telegram_id: int) -> None:
         """Удалить пользователя в Marzban (идемпотентно: 404 считаем успехом)."""
-        username = f"tg_{telegram_id}"
         async with httpx.AsyncClient(timeout=15.0) as client:
+            username = await self._username_for_existing(telegram_id)
             resp = await self._request("DELETE", f"/api/user/{username}", client)
         if resp.status_code not in (200, 204, 404):
             raise MarzbanError(f"delete: {resp.status_code} {resp.text}")
@@ -189,9 +238,9 @@ class MarzbanClient:
         if cached and now - cached[0] < max_age:
             return cached[1]
 
-        username = f"tg_{telegram_id}"
         try:
             async with httpx.AsyncClient(timeout=8.0) as client:
+                username = await self._username_for_existing(telegram_id)
                 data = await self.get_user(username, client)
         except Exception:
             logger.warning("Не удалось получить usage для %s", telegram_id, exc_info=True)
@@ -209,15 +258,18 @@ class MarzbanClient:
         self._usage_cache[telegram_id] = (now, result)
         return result
 
-    async def create_or_renew(self, telegram_id: int, plan: Plan) -> dict:
+    async def create_or_renew(self, telegram_id: int, plan: Plan, *, username: str | None = None) -> dict:
         """Создать пользователя в Marzban или продлить существующего.
 
+        New accounts use random Marzban usernames (`vxu_<random>`) to avoid
+        exposing Telegram IDs. Existing subscriptions keep their stored mapping;
+        legacy `tg_<telegram_id>` accounts continue to work.
         Возвращает dict: username, subscription_url, expire (unix), data_limit.
         """
-        username = f"tg_{telegram_id}"
         now = int(time.time())
 
         async with httpx.AsyncClient(timeout=20.0) as client:
+            username = await self._username_for_create_or_renew(telegram_id, client, username)
             existing = await self.get_user(username, client)
 
             added_seconds = plan.days * 86400

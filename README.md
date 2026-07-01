@@ -92,12 +92,14 @@ referral anti‑fraud, and Stars refunds.
   <img alt="FastAPI" src="https://img.shields.io/badge/FastAPI-+%20Uvicorn-009688?logo=fastapi&logoColor=white">
   <img alt="SQLAlchemy" src="https://img.shields.io/badge/SQLAlchemy-2%20async-D71F00?logo=sqlalchemy&logoColor=white">
   <img alt="PostgreSQL" src="https://img.shields.io/badge/PostgreSQL-16-4169E1?logo=postgresql&logoColor=white">
+  <img alt="Redis" src="https://img.shields.io/badge/Redis-rate%20limits-DC382D?logo=redis&logoColor=white">
   <img alt="Docker" src="https://img.shields.io/badge/Docker-Compose-2496ED?logo=docker&logoColor=white">
 </p>
 
 - **Bot** — `aiogram 3`
 - **Mini App / API** — `FastAPI` + `Uvicorn`
 - **Database** — `PostgreSQL 16` via `SQLAlchemy 2` (async) + `asyncpg`
+- **Rate limiting** — `Redis` shared limiter when `REDIS_URL` is set, in-memory fallback for local dev
 - **Provisioning** — `Marzban` API
 - **Deploy** — `Docker Compose`
 
@@ -162,9 +164,13 @@ SENTRY_DSN=                # optional error tracking (needs sentry-sdk)
 MINI_APP_URL=https://proxy.example.com
 SUBSCRIPTION_PUBLIC_BASE_URL=  # optional; empty = MINI_APP_URL for /sub/<token>
 DATABASE_URL=postgresql+asyncpg://vpnbot:vpnbot@db:5432/vpnbot
+REDIS_URL=redis://redis:6379/0
 MARZBAN_BASE_URL=https://vpn.example.com
 MARZBAN_USERNAME=admin
 MARZBAN_PASSWORD=password
+MARZBAN_TLS_CA_FILE=       # optional CA bundle for private/self-signed Marzban TLS
+TRUSTED_PROXY_IPS=172.23.0.0/16,127.0.0.1/32,::1/128
+TELEGRAM_INIT_DATA_MAX_AGE_SECONDS=21600
 SUPPORT_USERNAME=your_support
 ```
 
@@ -200,7 +206,7 @@ vexvpn-telegram-vpn/
 │  │  ├─ profile.py              # profile, support tickets
 │  │  └─ admin.py                # bot admin commands
 │  ├─ services/
-│  │  ├─ marzban.py              # Marzban create/renew logic + live usage + revoke_sub
+│  │  ├─ marzban.py              # Marzban create/renew logic + random identities + live usage
 │  │  ├─ payments.py             # invoice payload/price helpers
 │  │  ├─ plans.py                # effective tariff source from DB
 │  │  ├─ gamification.py         # streak / wheel / achievements
@@ -208,8 +214,8 @@ vexvpn-telegram-vpn/
 │  ├─ web/
 │  │  ├─ main.py                 # Mini App API, security headers, policy pages, subscription gateway
 │  │  ├─ admin.py                # Web admin API
-│  │  ├─ auth.py                 # Telegram initData validation
-│  │  └─ rate_limit.py
+│  │  ├─ auth.py                 # Telegram initData validation + replay window
+│  │  └─ rate_limit.py           # Redis-backed rate limiter with memory fallback
 │  └─ db/
 │     ├─ models.py
 │     ├─ repo.py
@@ -299,12 +305,19 @@ POST /api/admin/ticket/{id}/close                # → user notified, status=clo
 
 ## 🔐 Security
 
-- Telegram Mini App **`initData` HMAC** validation.
-- **Rate limits** on `POST /api/promo`, `POST /api/invoice-link`, `GET /api/check-vpn`, device reset and support endpoints.
-- **SSRF protection**: `check-vpn` only fetches subscription URLs from the configured Marzban host, over HTTPS, with redirects disabled.
+- Telegram Mini App **`initData` HMAC** validation requires `auth_date`; replayed payloads older than `TELEGRAM_INIT_DATA_MAX_AGE_SECONDS` are rejected.
+- **Rate limits** on `POST /api/promo`, `POST /api/invoice-link`, `GET /api/check-vpn`, device reset, support endpoints, public `/sub|/happ` gateway and public QR endpoints.
+- `REDIS_URL` enables shared production rate limits across workers/containers; without Redis the limiter falls back to local memory for single-process development.
+- **SSRF protection**: `check-vpn` only fetches subscription URLs from the exact configured Marzban origin: HTTPS scheme, same hostname and same effective port, with redirects disabled.
+- Public `/sub/{token}` fetches raw configs from Marzban with TLS verification enabled; private/self-signed Marzban installs can set `MARZBAN_TLS_CA_FILE`.
+- Client IP extraction only trusts `X-Forwarded-For` / `X-Real-IP` when the direct peer is inside `TRUSTED_PROXY_IPS`; public endpoint rate-limit keys use salted hashes, not raw IP strings.
 - User support messages are **HTML‑escaped** before Telegram output; promo codes validated against `^[A-Z0-9_]{2,32}$`.
 - The Mini App cabinet escapes all server/admin‑editable fields before `innerHTML`.
-- **Security headers**: `Content-Security-Policy`, `X-Content-Type-Options: nosniff`, `Referrer-Policy`, `Permissions-Policy`, `Cross-Origin-Opener-Policy`.
+- New Marzban accounts use random `vxu_<24 hex>` usernames; existing stored mappings and legacy `tg_<telegram_id>` accounts continue to work.
+- Device notes written to Marzban use `vexvpn | devices:<N>` instead of embedding Telegram IDs.
+- `httpx` / `httpcore` routine logs are lowered to `WARNING` in bot and Mini App processes.
+- Block-level free-VPN anti-fraud spikes notify admins without raw IPs, fingerprints or subscription tokens.
+- **Security headers**: `Content-Security-Policy`, `Strict-Transport-Security`, `X-Content-Type-Options: nosniff`, `Referrer-Policy`, `Permissions-Policy`, `Cross-Origin-Opener-Policy`.
 - Public privacy pages are served from the Mini App backend: `GET /privacy`, `GET /no-logs`, `GET /transparency`.
 - Mini App access logs are disabled in Docker Compose with `uvicorn --no-access-log`.
 
@@ -336,7 +349,9 @@ python -m unittest discover -s tests -v
 
 Coverage includes invoice payload roundtrips, `SALE30` pricing, `FREE7` as a free grant, Marzban
 renewal preserving unlimited traffic, traffic add‑on rules, device‑note handling, `get_usage` parsing
-& caching, gamification idempotency / anti‑fraud, the two‑way support thread, and atomic `finalize_grant`.
+& caching, random Marzban usernames, gamification idempotency / anti‑fraud, the two‑way support thread,
+atomic `finalize_grant`, Telegram `initData` replay checks, trusted-proxy IP handling, HSTS,
+strict Marzban origin checks, public endpoint throttling and the Redis limiter path.
 
 CI runs the full suite on every push / PR via [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
 
@@ -356,6 +371,20 @@ CI runs the full suite on every push / PR via [`.github/workflows/ci.yml`](.gith
 ---
 
 ## 📜 Changelog
+
+### 2026-07-01 — Security hardening: TLS, replay window, Redis limits and private identities
+
+- **Marzban identity privacy**: new accounts use random `vxu_<24 hex>` usernames; `subscriptions.marzban_username` is the local Telegram→Marzban mapping, existing mappings are preserved, and legacy `tg_<telegram_id>` accounts remain a fallback.
+- **Marzban notes**: device-limit notes no longer contain Telegram IDs; new/updated notes use `vexvpn | devices:<N>`.
+- **DB migration**: startup ensures unique index `uq_subscriptions_marzban_username` on `subscriptions.marzban_username`.
+- **Gateway TLS**: public `/sub/{token}` fetches Marzban configs with certificate verification enabled; `MARZBAN_TLS_CA_FILE` supports private/self-signed CA bundles.
+- **Trusted proxy IPs**: `_client_ip()` trusts `X-Forwarded-For` / `X-Real-IP` only from `TRUSTED_PROXY_IPS`; public rate-limit keys hash the hardened client IP.
+- **Telegram replay protection**: Mini App `initData` now requires `auth_date`, rejects missing/invalid/future values, and enforces `TELEGRAM_INIT_DATA_MAX_AGE_SECONDS`.
+- **Public endpoint limits**: `/sub/{token}`, `/happ/{token}`, `/api/qr.svg` and `/api/qr.png` are IP-rate-limited before expensive upstream/QR work.
+- **Strict SSRF origin check**: `check-vpn` now requires exact HTTPS scheme, hostname and effective port match with `MARZBAN_BASE_URL`.
+- **Shared rate limiting**: `REDIS_URL` enables a Redis fixed-window limiter across workers/containers; in-memory limiting remains as local fallback. Docker Compose now includes `redis` + `redisdata`, and `redis==5.2.1` is added.
+- **Headers and alerts**: Mini App responses include HSTS; bot/Mini App lower `httpx` logs to `WARNING`; block-level anti-fraud spikes send admin alerts without raw IPs, fingerprints or subscription tokens.
+- **Tests**: added `tests/test_web_security_hardening.py` plus Marzban-username regression coverage in `tests/test_payment_promo_traffic.py`.
 
 ### 2026-07-01 — Security Center, subscription gateway and link-protection events
 

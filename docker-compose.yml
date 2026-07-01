@@ -15,6 +15,19 @@ services:
       timeout: 5s
       retries: 10
 
+  redis:
+    image: redis:7-alpine
+    container_name: vpnbot_redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes --maxmemory 128mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
   bot:
     build: .
     container_name: vpnbot_app
@@ -22,6 +35,8 @@ services:
     env_file: .env
     depends_on:
       db:
+        condition: service_healthy
+      redis:
         condition: service_healthy
 
   miniapp:
@@ -33,6 +48,8 @@ services:
     command: uvicorn bot.web.main:app --host 0.0.0.0 --port 8080 --no-access-log
     depends_on:
       db:
+        condition: service_healthy
+      redis:
         condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=5).status==200 else 1)\""]
@@ -48,6 +65,7 @@ services:
 
 volumes:
   pgdata:
+  redisdata:
 
 networks:
   tgbot-public:
