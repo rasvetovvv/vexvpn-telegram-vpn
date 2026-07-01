@@ -1,0 +1,44 @@
+# ─── Secrets & environment ──────────────────────────────────
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets.*
+asds.txt
+
+# ─── Local backups & dumps ──────────────────────────────────
+backups/
+*.sql
+*.dump
+*.bak
+
+# ─── Python ─────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ─── Virtual environments ───────────────────────────────────
+.venv/
+venv/
+env/
+
+# ─── Databases ──────────────────────────────────────────────
+*.sqlite3
+*.db
+pgdata/
+
+# ─── Editors / OS ───────────────────────────────────────────
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+changes.md

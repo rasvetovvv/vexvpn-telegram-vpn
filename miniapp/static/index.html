@@ -1,0 +1,278 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <title>VexVPN Mini App</title>
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <div class="bg-grid"></div>
+  <div class="glow glow-a"></div>
+  <div class="glow glow-b"></div>
+  <div class="glow glow-c"></div>
+
+  <main class="app-shell">
+    <header class="hero-shell reveal">
+      <div class="hero-copy">
+        <p class="eyebrow">VexVPN Control Center</p>
+        <h1>Личный кабинет VPN прямо в Telegram</h1>
+        <p class="subtitle">Статус подписки, live countdown, покупки Stars, QR, проверка VPN, промокоды, рефералка и support — в одном WebApp.</p>
+        <div class="hero-actions">
+          <button class="primary" id="hero-buy">Продлить / Купить</button>
+          <button class="ghost" id="check-vpn">Проверить VPN</button>
+        </div>
+      </div>
+      <aside class="hero-device card-soft">
+        <div class="device-top"><span></span><span></span><span></span></div>
+        <div class="vpn-orbit">
+          <div class="orbit-ring"></div>
+          <strong id="hero-days">—</strong>
+          <small id="hero-status">loading</small>
+        </div>
+        <div class="mini-metrics">
+          <div><b id="mini-traffic">—</b><span>трафик</span></div>
+          <div><b id="mini-plan">—</b><span>тариф</span></div>
+        </div>
+      </aside>
+    </header>
+
+    <nav class="quick-nav reveal" aria-label="Быстрая навигация">
+      <a href="#free-section">Free VPN</a>
+      <a href="#dashboard">Кабинет</a>
+      <a href="#plans-section">Тарифы</a>
+      <a href="#connect-section">Подключение</a>
+      <a href="#bonus-section">Бонусы</a>
+      <a href="#support-section">Support</a>
+    </nav>
+
+    <section class="section reveal" id="free-section">
+      <article class="free-card" id="free-card">
+        <div class="free-card-glow"></div>
+        <div class="free-copy">
+          <p class="eyebrow">Daily Free Access</p>
+          <h2>Бесплатный VPN сегодня</h2>
+          <p class="free-available" id="free-available">Сегодня доступно: <b>+1 день +100 ГБ</b></p>
+          <p class="muted" id="free-status-text">Открой MiniApp, проверь устройство и забери ежедневный доступ.</p>
+        </div>
+        <div class="free-action">
+          <button class="primary free-big-btn" id="claim-free">Получить бесплатный VPN сегодня</button>
+          <div class="free-timer" id="free-timer">следующий бесплатный день через —</div>
+        </div>
+      </article>
+    </section>
+
+    <section class="dashboard-grid reveal" id="dashboard">
+      <article class="card big subscription-card" id="subscription-card">
+        <div class="card-head">
+          <span>Моя подписка</span>
+          <b id="plan-name">Загрузка…</b>
+        </div>
+
+        <div class="status-strip" id="status-strip">
+          <span id="status-pill">● Online</span>
+          <em id="countdown-warning">Синхронизация с сервером…</em>
+        </div>
+
+        <div class="ring-wrap">
+          <div class="ring" id="ring" style="--value:0">
+            <div class="ring-content">
+              <span class="days-number" id="days-left">—</span>
+              <small id="days-label">дней</small>
+              <em id="time-left-parts">—</em>
+            </div>
+          </div>
+          <div class="sub-meta">
+            <div class="meta-tile"><p>Действует до</p><strong id="expire-at">—</strong></div>
+            <div class="meta-tile"><p>Осталось</p><strong id="left-full">—</strong></div>
+            <div class="meta-tile"><p>Трафик</p><strong id="traffic-limit">—</strong></div>
+            <div class="meta-tile"><p>Статус</p><strong id="vpn-state">—</strong></div>
+            <div class="traffic-bar hidden" id="traffic-bar"><span id="traffic-bar-fill"></span></div>
+          </div>
+        </div>
+
+        <div class="usage-spark hidden" id="usage-spark">
+          <div class="spark-head"><span>Трафик по дням</span><b id="spark-total">—</b></div>
+          <div class="spark-bars" id="spark-bars"></div>
+        </div>
+
+        <div class="url-box">
+          <span id="sub-url">Подписка появится после покупки</span>
+        </div>
+        <div class="button-row">
+          <button class="primary" id="copy-sub">Скопировать ссылку</button>
+          <a class="primary" id="open-happ" target="_blank" style="display:none">Открыть в Happ</a>
+          <a class="primary" id="open-hiddify" target="_blank" style="display:none">Открыть в Hiddify</a>
+        </div>
+        <div class="button-row">
+          <a class="ghost" id="renew-link" href="#plans-section">Продлить в 1 клик</a>
+          <a class="ghost" id="buy-traffic-link" href="#traffic-plans">Купить трафик</a>
+        </div>
+        <div class="button-row">
+          <button class="ghost full" id="device-reset">Сбросить профиль / сменить устройство</button>
+        </div>
+        <div class="security-box" id="security-box">
+          <div class="card-head"><span>Security Center</span><b id="security-status">Protected</b></div>
+          <p class="muted" id="security-text">Проверяем защиту ссылки и сети…</p>
+          <div class="security-list" id="security-list"></div>
+        </div>
+      </article>
+
+      <article class="card qr-card">
+        <div class="card-head"><span>QR-код</span><b>Subscription</b></div>
+        <div class="qr-frame"><img id="qr" alt="QR-код подписки" /></div>
+        <p class="muted">Сканируй QR или скопируй ссылку для Hiddify, Happ, Streisand, v2rayNG или Shadowrocket.</p>
+        <div class="button-row compact">
+          <button class="ghost" id="download-qr">Скачать QR</button>
+          <button class="ghost" id="copy-sub-2">Копировать</button>
+        </div>
+      </article>
+    </section>
+
+    <section class="section reveal" id="plans-section">
+      <div class="section-title">
+        <p class="eyebrow">VexVPN Store</p>
+        <h2>Пакеты подписки</h2>
+        <span>Карточки в стиле каталога: крупный тариф, чистая цена, быстрый переход к оплате.</span>
+      </div>
+      <div class="promo-banner hidden" id="promo-banner"></div>
+      <div class="upsell-card" id="upsell-card">Загрузка рекомендации…</div>
+      <div class="plans" id="plans"></div>
+    </section>
+
+    <section class="section split reveal" id="bonus-section">
+      <article class="card">
+        <div class="card-head"><span>Промокоды</span><b>Coupons</b></div>
+        <p class="muted">FREE7 выдаёт дни бесплатно, SALE30 применяет скидку к следующей покупке.</p>
+        <div class="input-row">
+          <input id="promo-input" placeholder="Введите промокод" autocomplete="off" />
+          <button class="primary" id="apply-promo">Применить</button>
+        </div>
+        <div class="coupon-list" id="coupon-list"></div>
+        <div class="history-list" id="promo-history"></div>
+      </article>
+
+      <article class="card referral-card">
+        <div class="card-head"><span>Реферальный кабинет</span><b>+3 дня</b></div>
+        <p class="muted">Приглашай друзей и получай бонусные дни после их покупки.</p>
+        <div class="ref-stats">
+          <div><b id="ref-total">0</b><span>друзей</span></div>
+          <div><b id="ref-rewarded">0</b><span>бонусов</span></div>
+          <div><b>3</b><span>дня за друга</span></div>
+        </div>
+        <div class="levels">
+          <div><b>1 друг</b><span>+3 дня</span></div>
+          <div><b>3 друга</b><span>+10 дней</span></div>
+          <div><b>10 друзей</b><span>месяц бесплатно</span></div>
+        </div>
+        <div class="url-box"><span id="ref-link">—</span></div>
+        <div class="button-row">
+          <button class="primary" id="share-ref">Поделиться</button>
+          <button class="ghost" id="copy-ref">Скопировать</button>
+        </div>
+      </article>
+    </section>
+
+    <section class="section reveal" id="connect-section">
+      <div class="section-title">
+        <p class="eyebrow">VPN Setup</p>
+        <h2>Авто-инструкция под устройство</h2>
+        <span>Выбери платформу — WebApp покажет понятные шаги и ссылки на клиенты.</span>
+      </div>
+      <div class="device-tabs" id="device-tabs">
+        <button class="active" data-device="ios">iPhone</button>
+        <button data-device="android">Android</button>
+        <button data-device="windows">Windows</button>
+        <button data-device="macos">macOS</button>
+      </div>
+      <div class="connect-grid">
+        <article class="card steps-card">
+          <div class="card-head"><span id="device-title">iPhone</span><b>3 шага</b></div>
+          <ol class="steps" id="device-steps"></ol>
+        </article>
+        <article class="card client-card">
+          <div class="card-head"><span>Клиенты</span><b>Install</b></div>
+          <div class="client-list" id="client-list"></div>
+        </article>
+      </div>
+    </section>
+
+    <section class="section split reveal">
+      <article class="card">
+        <div class="card-head"><span>История покупок</span><b>Stars</b></div>
+        <div class="payments" id="payments"></div>
+      </article>
+      <article class="card game-card">
+        <div class="card-head"><span>Бонусы и достижения</span><b>Game</b></div>
+
+        <div class="gami-block" id="gami-daily">
+          <div class="gami-row">
+            <div><b>Ежедневный бонус</b><span class="muted" id="streak-text">Заходи 3 дня подряд — получи +1 день</span></div>
+            <div class="streak-flame"><b id="streak-count">0</b><i>🔥</i></div>
+          </div>
+          <div class="streak-dots" id="streak-dots"></div>
+          <button class="primary full" id="daily-bonus">Забрать ежедневный бонус</button>
+        </div>
+
+        <div class="gami-block" id="gami-wheel">
+          <div class="gami-row"><b>Колесо фортуны</b><span class="muted" id="wheel-status">1 спин в день</span></div>
+          <div class="wheel-segments" id="wheel-segments"></div>
+          <div class="wheel-result" id="wheel-result">Крути колесо раз в день — дни, трафик или промокод.</div>
+          <button class="primary full" id="spin-wheel">Крутить колесо</button>
+        </div>
+
+        <div class="gami-block">
+          <div class="gami-row"><b>Достижения</b><span class="muted" id="ach-count">0/5</span></div>
+          <div class="achievement-list" id="ach-grid"></div>
+        </div>
+      </article>
+    </section>
+
+    <section class="section reveal" id="support-section">
+      <div class="section-title">
+        <p class="eyebrow">Support Center</p>
+        <h2>Поддержка внутри WebApp</h2>
+        <span>Создай обращение по теме — поддержка ответит прямо здесь и в боте.</span>
+      </div>
+      <div class="support-grid">
+        <article class="card support-card">
+          <div class="card-head"><span>Новое обращение</span><b>New ticket</b></div>
+          <div class="topic-chips" id="topic-chips">
+            <button class="topic-chip active" data-topic="payment">Оплата / Stars</button>
+            <button class="topic-chip" data-topic="vpn">Не работает VPN</button>
+            <button class="topic-chip" data-topic="promo">Промокод</button>
+            <button class="topic-chip" data-topic="other">Другое</button>
+          </div>
+          <textarea id="ticket-text" rows="3" placeholder="Опиши проблему: что происходит, текст ошибки…"></textarea>
+          <button class="primary full" id="ticket-send">Создать обращение</button>
+        </article>
+        <article class="card">
+          <div class="card-head"><span>Мои обращения</span><b id="tickets-count">Tickets</b></div>
+          <div class="history-list" id="ticket-history"></div>
+          <a class="ghost full" id="support-link" target="_blank">Написать напрямую</a>
+        </article>
+      </div>
+    </section>
+
+    <footer class="footer">VexVPN · proxy.vexory.xyz · secure dark interface<br><a href="/privacy" target="_blank">Privacy Policy</a> · <a href="/no-logs" target="_blank">No-logs</a> · <a href="/transparency" target="_blank">Transparency</a></footer>
+  </main>
+
+  <div class="modal hidden" id="ticket-modal">
+    <div class="modal-card">
+      <div class="modal-head"><b id="modal-title">Заявка</b><button class="ghost icon" id="modal-close">✕</button></div>
+      <div class="thread" id="modal-thread"></div>
+      <div class="modal-reply" id="modal-reply">
+        <textarea id="modal-text" rows="2" placeholder="Ответить…"></textarea>
+        <div class="modal-actions">
+          <button class="primary" id="modal-send">Отправить</button>
+          <button class="ghost" id="modal-close-ticket">Закрыть заявку</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="toast" id="toast"></div>
+  <script src="/static/app.js"></script>
+</body>
+</html>

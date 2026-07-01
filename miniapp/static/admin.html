@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>VexVPN Admin</title>
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <link rel="stylesheet" href="/static/admin.css" />
+</head>
+<body>
+  <div class="bg"></div>
+  <main class="shell">
+    <header class="hero">
+      <div>
+        <p class="eyebrow">Admin control room</p>
+        <h1>VexVPN Admin</h1>
+        <p class="muted">Пользователи, платежи, подписки, компенсации, CSV, Marzban-ошибки и тарифы.</p>
+      </div>
+      <div class="actions">
+        <button id="refresh" class="primary">Обновить</button>
+        <button id="download-csv" class="ghost">CSV платежей</button>
+        <button id="download-users-csv" class="ghost">CSV пользователей</button>
+      </div>
+    </header>
+
+    <section id="auth-warning" class="card warning hidden">
+      Открой эту страницу через кнопку в Telegram-боте. Снаружи Telegram админ API недоступен.
+    </section>
+
+    <section class="metrics" id="metrics"></section>
+
+    <section class="grid two">
+      <article class="card">
+        <div class="section-head"><h2>Health dashboard</h2><button id="payments-check" class="ghost">Payments check</button></div>
+        <div id="health" class="conversion"></div>
+        <p class="muted small">Проверяет Telegram API, Marzban, DB, MiniApp, Caddy/proxy, ошибки и последние события.</p>
+      </article>
+      <article class="card">
+        <h2>Grant queue</h2>
+        <div class="table-wrap"><table><thead><tr><th>Дата</th><th>User</th><th>Plan</th><th>Status</th><th>Error</th></tr></thead><tbody id="grant-queue"></tbody></table></div>
+      </article>
+    </section>
+
+    <section class="grid two">
+      <article class="card">
+        <div class="section-head"><h2>Пользователи / подписки</h2><input id="user-search" placeholder="Telegram ID, username, Marzban username"></div>
+        <div class="table-wrap"><table><thead><tr><th>User</th><th>Plan</th><th>Expire</th><th>Traffic</th><th>Действия</th></tr></thead><tbody id="users"></tbody></table></div>
+      </article>
+
+      <article class="card">
+        <div class="section-head"><h2>Anti-abuse flags</h2><button id="reload-abuse" class="ghost">Обновить</button></div>
+        <div class="table-wrap"><table><thead><tr><th>Дата</th><th>User</th><th>Kind</th><th>Severity</th><th>Details</th></tr></thead><tbody id="abuse-flags"></tbody></table></div>
+      </article>
+    </section>
+
+    <section class="grid two">
+      <article class="card">
+        <div class="section-head"><h2>Платежи</h2><input id="payment-search" placeholder="ID, username, plan, charge"></div>
+        <label class="check"><input id="problem-only" type="checkbox"> только проблемные Marzban</label>
+        <div class="table-wrap"><table><thead><tr><th>Дата</th><th>User</th><th>Plan</th><th>⭐</th><th>Status</th></tr></thead><tbody id="payments"></tbody></table></div>
+      </article>
+
+      <article class="card">
+        <h2>Ручная выдача / компенсация</h2>
+        <div class="form">
+          <input id="grant-id" placeholder="Telegram ID">
+          <input id="grant-days" type="number" min="0" value="1" placeholder="Дни">
+          <input id="grant-gb" type="number" min="0" value="0" placeholder="ГБ трафика">
+          <input id="grant-reason" value="compensation" placeholder="Причина">
+          <button id="grant-btn" class="primary">Выдать / продлить</button>
+        </div>
+        <p class="muted small">Если указать дни — подписка продлится. Если указать ГБ — трафик добавится. Безлимит не ухудшается.</p>
+      </article>
+
+      <article class="card">
+        <h2>Конверсия</h2>
+        <div id="conversion" class="conversion"></div>
+      </article>
+    </section>
+
+    <section class="card">
+      <div class="section-head"><h2>Тикеты поддержки <span id="tickets-open-badge" class="pill"></span></h2>
+        <select id="ticket-filter">
+          <option value="active">Открытые / ждут ответа</option>
+          <option value="open">Только новые</option>
+          <option value="answered">Отвеченные</option>
+          <option value="closed">Закрытые</option>
+        </select>
+      </div>
+      <div class="table-wrap"><table><thead><tr><th>#</th><th>User</th><th>Тема</th><th>Статус</th><th>Обновлён</th></tr></thead><tbody id="admin-tickets"></tbody></table></div>
+    </section>
+
+    <section class="card">
+      <div class="section-head"><h2>Управление тарифами</h2><button id="reload-tariffs" class="ghost">Обновить тарифы</button></div>
+      <div id="tariffs" class="tariffs"></div>
+      <p class="muted small">Изменения сразу работают и в WebApp, и в меню бота — перезапуск не нужен.</p>
+    </section>
+
+    <section class="grid two">
+      <article class="card">
+        <h2>Логи ошибок/действий Marzban</h2>
+        <div class="table-wrap"><table><thead><tr><th>Дата</th><th>User</th><th>Action</th><th>Status</th><th>Message</th></tr></thead><tbody id="marzban-logs"></tbody></table></div>
+      </article>
+      <article class="card">
+        <div class="section-head"><h2>Admin audit log</h2><input id="audit-filter" placeholder="Фильтр по action (напр. refund)"></div>
+        <div class="table-wrap"><table><thead><tr><th>Дата</th><th>Admin</th><th>Action</th><th>Target</th><th>Details</th></tr></thead><tbody id="audit-log"></tbody></table></div>
+      </article>
+    </section>
+  </main>
+  <div class="amodal hidden" id="ticket-modal">
+    <div class="amodal-card">
+      <div class="section-head"><h2 id="amodal-title">Тикет</h2><button class="ghost" id="amodal-close">✕</button></div>
+      <div id="amodal-thread" class="athread"></div>
+      <textarea id="amodal-text" rows="2" placeholder="Ответ пользователю…"></textarea>
+      <div class="row">
+        <button class="primary" id="amodal-send">Отправить ответ</button>
+        <button class="ghost" id="amodal-closeticket">Закрыть тикет</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast"></div>
+  <script src="/static/admin.js"></script>
+</body>
+</html>
