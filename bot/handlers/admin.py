@@ -35,8 +35,9 @@ from bot.services.promos import get_promo, parse_promo_create_args, promo_use_co
 
 router = Router()
 _ADMIN_RATE: dict[tuple[int, str], float] = {}
-_PENDING_BROADCAST: dict[int, tuple[str, str, list[int]]] = {}
-_PENDING_REPLY: dict[int, int] = {}  # admin_id -> ticket_id (ожидание текста ответа)
+_PENDING_TTL_SECONDS = 30 * 60
+_PENDING_BROADCAST: dict[int, tuple[float, str, str, list[int]]] = {}
+_PENDING_REPLY: dict[int, tuple[float, int]] = {}  # admin_id -> (created_at, ticket_id)
 
 
 def _admin_limited(admin_id: int, action: str, seconds: int = 20) -> bool:
@@ -47,6 +48,57 @@ def _admin_limited(admin_id: int, action: str, seconds: int = 20) -> bool:
         return True
     _ADMIN_RATE[key] = now
     return False
+
+
+def _now() -> float:
+    return asyncio.get_event_loop().time()
+
+
+def _cleanup_pending() -> None:
+    now = _now()
+    for admin_id, (created_at, *_rest) in list(_PENDING_BROADCAST.items()):
+        if now - created_at > _PENDING_TTL_SECONDS:
+            _PENDING_BROADCAST.pop(admin_id, None)
+    for admin_id, (created_at, _ticket_id) in list(_PENDING_REPLY.items()):
+        if now - created_at > _PENDING_TTL_SECONDS:
+            _PENDING_REPLY.pop(admin_id, None)
+
+
+def _pending_reply_admin_ids() -> set[int]:
+    _cleanup_pending()
+    return set(_PENDING_REPLY)
+
+
+def _set_pending_broadcast(admin_id: int, segment: str, body: str, ids: list[int]) -> None:
+    _cleanup_pending()
+    _PENDING_BROADCAST[admin_id] = (_now(), segment, body, ids)
+
+
+def _pop_pending_broadcast(admin_id: int) -> tuple[str, str, list[int]] | None:
+    _cleanup_pending()
+    payload = _PENDING_BROADCAST.pop(admin_id, None)
+    if not payload:
+        return None
+    created_at, segment, body, ids = payload
+    if _now() - created_at > _PENDING_TTL_SECONDS:
+        return None
+    return segment, body, ids
+
+
+def _set_pending_reply(admin_id: int, ticket_id: int) -> None:
+    _cleanup_pending()
+    _PENDING_REPLY[admin_id] = (_now(), ticket_id)
+
+
+def _pop_pending_reply(admin_id: int) -> int | None:
+    _cleanup_pending()
+    payload = _PENDING_REPLY.pop(admin_id, None)
+    if not payload:
+        return None
+    created_at, ticket_id = payload
+    if _now() - created_at > _PENDING_TTL_SECONDS:
+        return None
+    return ticket_id
 
 
 def _confirm_markup(action: str, telegram_id: int) -> InlineKeyboardMarkup:
@@ -134,7 +186,7 @@ async def broadcast(message: Message) -> None:
     if _admin_limited(message.from_user.id, "broadcast", 30):
         await message.answer("⏳ Rate limit: подожди 30 секунд перед новой рассылкой.")
         return
-    _PENDING_BROADCAST[message.from_user.id] = (segment, body, ids)
+    _set_pending_broadcast(message.from_user.id, segment, body, ids)
     await message.answer(
         f"📣 <b>Preview рассылки</b>\nСегмент: <code>{html.escape(segment)}</code>\nПолучателей: <b>{len(ids)}</b>\n\n{html.escape(body[:1000])}",
         reply_markup=_broadcast_confirm_markup(message.from_user.id),
@@ -195,7 +247,7 @@ async def broadcast_confirm(cq: CallbackQuery) -> None:
     if int(action) != cq.from_user.id:
         await cq.answer("Это подтверждение не для тебя", show_alert=True)
         return
-    payload = _PENDING_BROADCAST.pop(cq.from_user.id, None)
+    payload = _pop_pending_broadcast(cq.from_user.id)
     if not payload:
         await cq.answer("Preview устарел. Запусти /broadcast заново.", show_alert=True)
         return
@@ -428,7 +480,7 @@ async def admin_reply_start(cq: CallbackQuery) -> None:
         await cq.answer("Нет доступа", show_alert=True)
         return
     ticket_id = int(cq.data.split(":", 1)[1])
-    _PENDING_REPLY[cq.from_user.id] = ticket_id
+    _set_pending_reply(cq.from_user.id, ticket_id)
     await cq.message.answer(f"✍️ Напиши ответ для тикета #{ticket_id} одним сообщением. Отмена — /cancel")
     await cq.answer()
 
@@ -457,13 +509,13 @@ async def admin_close_ticket(cq: CallbackQuery) -> None:
 
 @router.message(Command("cancel"))
 async def admin_cancel_reply(message: Message) -> None:
-    if _PENDING_REPLY.pop(message.from_user.id, None) is not None:
+    if _pop_pending_reply(message.from_user.id) is not None:
         await message.answer("Ответ отменён.")
 
 
-@router.message(lambda m: bool(m.from_user) and m.from_user.id in _PENDING_REPLY, F.text)
+@router.message(lambda m: bool(m.from_user) and m.from_user.id in _pending_reply_admin_ids(), F.text)
 async def admin_reply_collect(message: Message) -> None:
-    ticket_id = _PENDING_REPLY.pop(message.from_user.id, None)
+    ticket_id = _pop_pending_reply(message.from_user.id)
     if ticket_id is None:
         return
     body = (message.text or "")[:1900]

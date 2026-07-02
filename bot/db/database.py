@@ -47,6 +47,22 @@ async def _ensure_unique_index(conn, table: str, index_name: str, column: str) -
         await conn.execute(text(f"CREATE UNIQUE INDEX {index_name} ON {table} ({column})"))
 
 
+async def _ensure_varchar_length(conn, table: str, column: str, min_length: int) -> None:
+    """Widen VARCHAR only when needed to avoid repeated ALTER TABLE locks."""
+    current = await conn.scalar(
+        text(
+            """
+            SELECT character_maximum_length
+            FROM information_schema.columns
+            WHERE table_name = :table AND column_name = :column
+            """
+        ),
+        {"table": table, "column": column},
+    )
+    if current is not None and int(current) < min_length:
+        await conn.execute(text(f"ALTER TABLE {table} ALTER COLUMN {column} TYPE VARCHAR({min_length})"))
+
+
 async def init_db() -> None:
     """Создать таблицы и мягко обновить старую схему."""
     async with engine.begin() as conn:
@@ -86,7 +102,7 @@ async def init_db() -> None:
         await _ensure_column(conn, "promo_codes", "new_only", "new_only BOOLEAN DEFAULT FALSE")
         await _ensure_column(conn, "promo_codes", "old_only", "old_only BOOLEAN DEFAULT FALSE")
         await _ensure_column(conn, "promo_codes", "disabled_at", "disabled_at TIMESTAMP WITH TIME ZONE")
-        await conn.execute(text("ALTER TABLE reminder_logs ALTER COLUMN marker TYPE VARCHAR(32)"))
+        await _ensure_varchar_length(conn, "reminder_logs", "marker", 32)
         await _ensure_unique_index(conn, "payments", "uq_payments_charge_id", "charge_id")
         await _ensure_column(conn, "grant_queue", "payment_id", "payment_id INTEGER")
         await _ensure_column(conn, "grant_queue", "stars_amount", "stars_amount INTEGER DEFAULT 0")

@@ -251,6 +251,8 @@ vexvpn-telegram-vpn/
 - Tariffs resolve from `tariff_settings` as the single effective source (`is_trial`, `traffic_only`, `unlimited`).
 - Traffic add‑ons add to the existing limit and never reduce unlimited traffic.
 - Subscription days extend from `max(now, current_expire)`.
+- Free/manual promo grants reserve `PromoUse` before Marzban work through `reserve_promo_for_user()`, so concurrent `/promo` requests cannot overuse once-per-user or global promo limits.
+- Paid/discount promo flows still mark promo usage only after successful payment/grant, preserving the existing billing behavior.
 
 ---
 
@@ -297,6 +299,7 @@ POST /api/admin/ticket/{id}/close                # → user notified, status=clo
 
 - `ADMIN_IDS` — full admin access (panel, grants, broadcast, user actions).
 - `SUPER_ADMIN_IDS` — required for destructive actions (delete user, refund). Empty ⇒ all admins are super.
+- Bot-side pending admin broadcast previews and ticket-reply states expire after 30 minutes, so abandoned process-local state is not kept indefinitely.
 
 **Refunds** — `refundStarPayment(user_id, charge_id)`. Only real Stars payments are refundable;
 `PROMO-` / `TEST-` / `ADMIN-` and zero‑Stars rows are rejected. On success the row becomes `refunded`.
@@ -332,6 +335,15 @@ POST /api/admin/ticket/{id}/close                # → user notified, status=clo
 - `first_connect_loop` watches active subscriptions for first real usage and sends a one-shot "VPN works" message after traffic/online status appears.
 - `/sub/{token}` proxies Marzban subscriptions: browsers receive a status/instruction page; VPN clients receive raw config. `/happ/{token}` and `?happ=1` return cleaned plain VLESS links for Happ.
 
+**Runtime & race hardening**
+
+- Free promo activation now reserves the promo atomically before VPN grant work, then calls `_grant_subscription(..., promo_already_reserved=True)` to avoid double-burning or double-grant races.
+- `successful_payment` defensively ignores malformed Telegram payment updates without `from_user`.
+- Post-purchase follow-up tasks are retained in `_BACKGROUND_TASKS` until completion, instead of being fire-and-forget only.
+- `MarzbanClient` serializes token refresh with `_auth_lock` and protects server/usage caches with async locks.
+- Startup migrations use `_ensure_varchar_length()` for `reminder_logs.marker`, widening only when needed instead of issuing repeated `ALTER TABLE` statements.
+- Admin broadcast confirmation and support reply pending states use timestamped helpers with a 30-minute TTL.
+
 > ⚠️ **Never commit your real `.env`.** It is gitignored by default. Rotate any token/password that has ever been shared.
 
 ---
@@ -351,7 +363,8 @@ Coverage includes invoice payload roundtrips, `SALE30` pricing, `FREE7` as a fre
 renewal preserving unlimited traffic, traffic add‑on rules, device‑note handling, `get_usage` parsing
 & caching, random Marzban usernames, gamification idempotency / anti‑fraud, the two‑way support thread,
 atomic `finalize_grant`, Telegram `initData` replay checks, trusted-proxy IP handling, HSTS,
-strict Marzban origin checks, public endpoint throttling and the Redis limiter path.
+strict Marzban origin checks, public endpoint throttling, Redis limiter path, Marzban auth-lock concurrency,
+background task retention and admin pending-state expiry.
 
 CI runs the full suite on every push / PR via [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
 
@@ -371,6 +384,17 @@ CI runs the full suite on every push / PR via [`.github/workflows/ci.yml`](.gith
 ---
 
 ## 📜 Changelog
+
+### 2026-07-02 — Promo/payment and runtime race hardening
+
+- **Atomic free-promo reservation**: `reserve_promo_for_user()` serializes free/manual promo reservation per promo code on PostgreSQL with an advisory transaction lock, validates limits, inserts `PromoUse`, and handles duplicate reservation as "Промокод уже использован".
+- **Bot promo flow**: `/promo` free/manual grants reserve the promo before calling Marzban and pass `promo_already_reserved=True` into `_grant_subscription()`, so validation is not repeated after the reservation.
+- **Payment handler guard**: `successful_payment` now exits safely if Telegram sends a malformed payment update without `from_user`.
+- **Background tasks**: post-purchase follow-up messages are scheduled via `_schedule_background()` and kept in `_BACKGROUND_TASKS` until done.
+- **Startup migration guard**: `_ensure_varchar_length()` widens `reminder_logs.marker` only when the DB column is shorter than required, avoiding repeated startup DDL locks.
+- **Marzban concurrency**: `MarzbanClient` adds async locks for token refresh, server cache and usage cache, preventing duplicate auth refreshes and inconsistent cache writes under concurrent tasks.
+- **Admin pending TTL**: broadcast confirmations and support-ticket reply states are timestamped and expire after 30 minutes through helper setters/getters.
+- **Tests**: added runtime-hardening tests for Marzban auth serialization, background task retention, admin pending expiry and public-rate-limit fallback behavior.
 
 ### 2026-07-01 — Security hardening: TLS, replay window, Redis limits and private identities
 

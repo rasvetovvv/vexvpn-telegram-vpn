@@ -56,10 +56,11 @@ class WebSecurityHardeningTests(unittest.TestCase):
     def test_public_rate_limit_uses_client_ip_before_upstream_work(self):
         req = FakeRequest('203.0.113.20')
         rule = RateLimit(limit=2, window_seconds=60)
-        web_main._require_public_ip_rate_limit(req, 'unit-test-public', rule)
-        web_main._require_public_ip_rate_limit(req, 'unit-test-public', rule)
-        with self.assertRaises(HTTPException) as ctx:
+        with patch.object(rate_limit_mod, '_redis_client', return_value=None):
             web_main._require_public_ip_rate_limit(req, 'unit-test-public', rule)
+            web_main._require_public_ip_rate_limit(req, 'unit-test-public', rule)
+            with self.assertRaises(HTTPException) as ctx:
+                web_main._require_public_ip_rate_limit(req, 'unit-test-public', rule)
         self.assertEqual(ctx.exception.status_code, 429)
         # The stored key is namespaced and hashed; raw IP must not appear in buckets.
         self.assertFalse(any('203.0.113.20' in key for key in _BUCKETS))

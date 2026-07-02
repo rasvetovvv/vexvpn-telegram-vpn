@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import unittest
+from unittest.mock import patch
 
 from bot.config import PROMOS, Plan
 from bot.services import payments
@@ -327,6 +328,50 @@ class TrafficGrantTests(unittest.IsolatedAsyncioTestCase):
         client._invalidate_usage(777)
         await client.get_usage(777)
         self.assertEqual(calls["n"], 2)
+
+
+class RuntimeHardeningTests(unittest.IsolatedAsyncioTestCase):
+    async def test_marzban_auth_header_serializes_concurrent_auth(self) -> None:
+        client = MarzbanClient()
+        calls = {"n": 0}
+
+        async def fake_auth(_http_client):
+            calls["n"] += 1
+            await asyncio.sleep(0.01)
+            client._token = "token"
+            client._token_exp = 9_999_999_999
+
+        client._authenticate = fake_auth  # type: ignore[method-assign]
+        headers = await asyncio.gather(*(client._auth_header(object()) for _ in range(5)))
+        self.assertEqual(calls["n"], 1)
+        self.assertEqual(headers, [{"Authorization": "Bearer token"}] * 5)
+
+    async def test_payment_background_task_reference_is_retained_until_done(self) -> None:
+        from bot.handlers import payments as payment_handlers
+
+        payment_handlers._BACKGROUND_TASKS.clear()
+
+        async def short_task():
+            await asyncio.sleep(0.01)
+
+        task = payment_handlers._schedule_background(short_task())
+        self.assertIn(task, payment_handlers._BACKGROUND_TASKS)
+        await task
+        await asyncio.sleep(0)
+        self.assertNotIn(task, payment_handlers._BACKGROUND_TASKS)
+
+    async def test_admin_pending_state_expires(self) -> None:
+        from bot.handlers import admin
+
+        admin._PENDING_BROADCAST.clear()
+        admin._PENDING_REPLY.clear()
+        current = {"t": 100.0}
+        with patch.object(admin, "_now", side_effect=lambda: current["t"]):
+            admin._set_pending_broadcast(1, "all", "body", [10])
+            admin._set_pending_reply(1, 55)
+            current["t"] += admin._PENDING_TTL_SECONDS + 1
+            self.assertIsNone(admin._pop_pending_broadcast(1))
+            self.assertIsNone(admin._pop_pending_reply(1))
 
 
 class FormatTests(unittest.TestCase):

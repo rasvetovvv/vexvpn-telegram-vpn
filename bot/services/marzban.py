@@ -1,6 +1,7 @@
 """Клиент Marzban API: создание и продление подписок."""
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import secrets
@@ -57,6 +58,9 @@ class MarzbanClient:
         # Кабинет авто-рефрешится раз в минуту у каждого юзера — без кэша это N запросов
         # к панели в минуту. Кэш на ~45с снимает нагрузку, оставаясь «почти live».
         self._usage_cache: dict[int, tuple[float, dict | None]] = {}
+        self._auth_lock = asyncio.Lock()
+        self._usage_cache_lock = asyncio.Lock()
+        self._servers_lock = asyncio.Lock()
 
     # ── авторизация ──────────────────────────────────────────────
     async def _authenticate(self, client: httpx.AsyncClient) -> None:
@@ -75,7 +79,9 @@ class MarzbanClient:
 
     async def _auth_header(self, client: httpx.AsyncClient) -> dict[str, str]:
         if not self._token or time.time() > self._token_exp:
-            await self._authenticate(client)
+            async with self._auth_lock:
+                if not self._token or time.time() > self._token_exp:
+                    await self._authenticate(client)
         return {"Authorization": f"Bearer {self._token}"}
 
     async def _request(
@@ -86,7 +92,10 @@ class MarzbanClient:
             method, f"{self.base_url}{path}", headers=headers, **kwargs
         )
         if resp.status_code == 401:  # токен протух — переавторизуемся и повторяем
-            await self._authenticate(client)
+            async with self._auth_lock:
+                self._token = None
+                self._token_exp = 0.0
+                await self._authenticate(client)
             headers = {"Authorization": f"Bearer {self._token}"}
             resp = await client.request(
                 method, f"{self.base_url}{path}", headers=headers, **kwargs
@@ -205,24 +214,25 @@ class MarzbanClient:
     async def servers_online(self) -> int | None:
         """Кол-во подключённых нод Marzban (best-effort, кэш 5 минут)."""
         now = time.time()
-        if now < self._servers_exp:
-            return self._servers_cache
-        value: int | None = None
-        try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                resp = await self._request("GET", "/api/nodes", client)
-            if resp.status_code == 200:
-                nodes = resp.json()
-                if isinstance(nodes, list):
-                    connected = sum(1 for n in nodes if str(n.get("status")).lower() == "connected")
-                    # У одно-нодовых установок список нод пуст — считаем 1 активный сервер.
-                    value = connected if nodes else 1
-        except Exception:
-            logger.warning("Не удалось получить статус нод Marzban", exc_info=True)
-            value = None
-        self._servers_cache = value
-        self._servers_exp = now + 300  # не дёргаем панель чаще раза в 5 минут
-        return value
+        async with self._servers_lock:
+            if now < self._servers_exp:
+                return self._servers_cache
+            value: int | None = None
+            try:
+                async with httpx.AsyncClient(timeout=5.0) as client:
+                    resp = await self._request("GET", "/api/nodes", client)
+                if resp.status_code == 200:
+                    nodes = resp.json()
+                    if isinstance(nodes, list):
+                        connected = sum(1 for n in nodes if str(n.get("status")).lower() == "connected")
+                        # У одно-нодовых установок список нод пуст — считаем 1 активный сервер.
+                        value = connected if nodes else 1
+            except Exception:
+                logger.warning("Не удалось получить статус нод Marzban", exc_info=True)
+                value = None
+            self._servers_cache = value
+            self._servers_exp = now + 300  # не дёргаем панель чаще раза в 5 минут
+            return value
 
     async def get_usage(self, telegram_id: int, *, max_age: float = 45.0) -> dict | None:
         """Текущее потребление пользователя (best-effort, не бросает наружу).
@@ -234,9 +244,10 @@ class MarzbanClient:
         кэшируются — чтобы быстро восстановиться после недоступности панели.
         """
         now = time.time()
-        cached = self._usage_cache.get(telegram_id)
-        if cached and now - cached[0] < max_age:
-            return cached[1]
+        async with self._usage_cache_lock:
+            cached = self._usage_cache.get(telegram_id)
+            if cached and now - cached[0] < max_age:
+                return cached[1]
 
         try:
             async with httpx.AsyncClient(timeout=8.0) as client:
@@ -255,7 +266,8 @@ class MarzbanClient:
                 "status": data.get("status"),
                 "online_at": data.get("online_at") or data.get("last_online") or data.get("last_online_at"),
             }
-        self._usage_cache[telegram_id] = (now, result)
+        async with self._usage_cache_lock:
+            self._usage_cache[telegram_id] = (now, result)
         return result
 
     async def create_or_renew(self, telegram_id: int, plan: Plan, *, username: str | None = None) -> dict:

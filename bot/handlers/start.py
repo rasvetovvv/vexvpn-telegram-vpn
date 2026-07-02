@@ -13,7 +13,7 @@ from bot.db.database import session_maker
 from bot.db.repo import ensure_user, get_user, log_event, set_active_promo
 from bot.handlers.payments import _grant_subscription
 from bot.services.plans import get_visible_plans
-from bot.services.promos import get_promo, promo_to_plan, validate_promo_for_user
+from bot.services.promos import get_promo, promo_to_plan, reserve_promo_for_user, validate_promo_for_user
 
 router = Router()
 
@@ -96,8 +96,12 @@ async def _apply_promo(message: Message, code: str) -> None:
     if promo.free_plan_key or promo.kind in {"days", "traffic", "trial"}:
         async with session_maker() as session:
             plan = await promo_to_plan(session, promo)
-        if plan is None:
-            await message.answer(texts.PROMO_INVALID)
+            if plan is None:
+                await message.answer(texts.PROMO_INVALID)
+                return
+            reserve_err = await reserve_promo_for_user(session, message.from_user.id, promo)
+        if reserve_err:
+            await message.answer(reserve_err)
             return
         await message.answer(f"🎁 Промокод {code} принят. Выдаю «{plan.title}» бесплатно…")
         # Детерминированный charge_id — защита от повторной выдачи.
@@ -109,6 +113,7 @@ async def _apply_promo(message: Message, code: str) -> None:
             charge_id=f"PROMO-{code}-{message.from_user.id}",
             promo_code=code,
             allow_trial_repeat=not plan.is_trial,
+            promo_already_reserved=True,
         )
         return
 

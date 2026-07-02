@@ -1,6 +1,7 @@
 """Оплата Telegram Stars и выдача подписки."""
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
 from datetime import datetime, timezone
@@ -45,6 +46,7 @@ from bot.utils import fmt_date, fmt_traffic
 
 logger = logging.getLogger(__name__)
 router = Router()
+_BACKGROUND_TASKS: set[asyncio.Task] = set()
 
 DAILY_FREE_DAYS = 1
 DAILY_FREE_TRAFFIC_GB = 100
@@ -69,12 +71,18 @@ async def _notify_admins(bot, text: str) -> None:
 
 
 async def _post_purchase_followup(bot, telegram_id: int) -> None:
-    import asyncio
     await asyncio.sleep(10 * 60)
     try:
         await bot.send_message(telegram_id, texts.POST_PURCHASE_CHECK, reply_markup=keyboards.success_menu())
     except Exception:
         logger.exception("Не удалось отправить follow-up после покупки %s", telegram_id)
+
+
+def _schedule_background(coro) -> asyncio.Task:
+    task = asyncio.create_task(coro)
+    _BACKGROUND_TASKS.add(task)
+    task.add_done_callback(_BACKGROUND_TASKS.discard)
+    return task
 
 
 async def _validate_plan_for_user(
@@ -84,6 +92,7 @@ async def _validate_plan_for_user(
     promo_code: str | None = None,
     *,
     allow_trial_repeat: bool = False,
+    promo_already_reserved: bool = False,
 ) -> str | None:
     """Вернуть текст ошибки, если счёт/выдача сейчас недопустимы."""
     user = await get_user(session, telegram_id)
@@ -95,7 +104,7 @@ async def _validate_plan_for_user(
     if plan.traffic_only and (not sub or (sub.expire_at if sub.expire_at.tzinfo else sub.expire_at.replace(tzinfo=timezone.utc)) <= now):
         return "Пакет трафика можно купить только к активной подписке"
 
-    if promo_code:
+    if promo_code and not promo_already_reserved:
         promo = await get_promo(session, promo_code)
         # допускаем скидочные и бесплатные промокоды
         if not promo or not (promo.percent or promo.free_plan_key or promo.kind in {"days", "traffic", "trial"}):
@@ -116,6 +125,7 @@ async def _grant_subscription(
     charge_id: str,
     promo_code: str | None = None,
     allow_trial_repeat: bool = False,
+    promo_already_reserved: bool = False,
 ) -> None:
     """Создать/продлить подписку и ответить пользователю."""
     async with session_maker() as session:
@@ -131,6 +141,7 @@ async def _grant_subscription(
             plan,
             promo_code,
             allow_trial_repeat=allow_trial_repeat,
+            promo_already_reserved=promo_already_reserved,
         )
         if error:
             # Если деньги уже списаны (реальная оплата), но выдать нельзя —
@@ -219,8 +230,9 @@ async def _grant_subscription(
             log_message=f"plan={plan.key}; payment_id={payment.id}",
             log_paid=stars_amount > 0,
         )
-        # Пометка купона — отдельно (идемпотентно), чтобы гонка не откатывала выдачу.
-        if promo_code:
+        # Free promo grants reserve PromoUse before Marzban work to close
+        # validation/grant races. Paid/discount flows still mark after success.
+        if promo_code and not promo_already_reserved:
             await mark_promo_used(session, telegram_id, promo_code)
 
     await target.answer(
@@ -236,8 +248,7 @@ async def _grant_subscription(
     )
 
     if stars_amount > 0:
-        import asyncio
-        asyncio.create_task(_post_purchase_followup(target.bot, telegram_id))
+        _schedule_background(_post_purchase_followup(target.bot, telegram_id))
 
     # Реферальный бонус: только за реальную покупку (анти-фрод против фарма триалов)
     # и не чаще REFERRAL_MAX_PER_DAY начислений одному рефереру в сутки.
@@ -488,6 +499,9 @@ async def pre_checkout(query: PreCheckoutQuery) -> None:
 
 @router.message(F.successful_payment)
 async def on_successful_payment(message: Message) -> None:
+    if not message.from_user:
+        logger.warning("successful_payment without from_user: chat_id=%s", getattr(message.chat, "id", None))
+        return
     sp = message.successful_payment
     key, promo_code = pay.parse_payload(sp.invoice_payload)
     async with session_maker() as session:

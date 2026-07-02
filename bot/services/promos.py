@@ -4,8 +4,9 @@ from __future__ import annotations
 import re
 from datetime import datetime, timezone
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.exc import IntegrityError
 
 from bot.config import PROMOS, PLANS, Plan, Promo
 from bot.db.models import Payment, PromoCode, PromoUse, Subscription, User
@@ -53,6 +54,29 @@ async def payment_count(session: AsyncSession, telegram_id: int) -> int:
 
 async def promo_use_count(session: AsyncSession, code: str) -> int:
     return await session.scalar(select(func.count(PromoUse.id)).where(PromoUse.code == code.upper())) or 0
+
+
+async def reserve_promo_for_user(session: AsyncSession, telegram_id: int, promo: Promo) -> str | None:
+    """Atomically reserve a promo use for free/manual promo grants.
+
+    Validation-only checks are race-prone: two concurrent /promo requests can both
+    see no PromoUse row or a not-yet-exhausted global limit. PostgreSQL advisory
+    lock serializes reservations per promo code, then the PromoUse unique
+    constraint enforces once-per-user at the database layer.
+    """
+    code = promo.code.upper()
+    if session.bind and session.bind.dialect.name == "postgresql":
+        await session.execute(text("SELECT pg_advisory_xact_lock(hashtext(:key))"), {"key": f"promo:{code}"})
+    err = await validate_promo_for_user(session, telegram_id, promo)
+    if err:
+        return err
+    session.add(PromoUse(telegram_id=telegram_id, code=code))
+    try:
+        await session.commit()
+        return None
+    except IntegrityError:
+        await session.rollback()
+        return "Промокод уже использован"
 
 
 async def validate_promo_for_user(session: AsyncSession, telegram_id: int, promo: Promo) -> str | None:
